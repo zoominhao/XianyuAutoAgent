@@ -77,6 +77,19 @@ class ChatContextManager:
         )
         ''')
         
+        # 创建协商价格表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS agreed_prices (
+            chat_id TEXT PRIMARY KEY,
+            item_id TEXT,
+            original_amount REAL,
+            agreed_price REAL,
+            discount_rate REAL,
+            store_name TEXT,
+            last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
         # 创建商品信息表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS items (
@@ -306,4 +319,40 @@ class ChatContextManager:
             logger.error(f"获取议价次数时出错: {e}")
             return 0
         finally:
-            conn.close() 
+            conn.close()
+
+    def save_agreed_price(self, chat_id, item_id, original_amount, agreed_price, discount_rate, store_name=""):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO agreed_prices (chat_id, item_id, original_amount, agreed_price, discount_rate, store_name, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id)
+                DO UPDATE SET item_id=?, original_amount=?, agreed_price=?, discount_rate=?, store_name=?, last_updated=?
+                """,
+                (chat_id, item_id, original_amount, agreed_price, discount_rate, store_name, datetime.now().isoformat(),
+                 item_id, original_amount, agreed_price, discount_rate, store_name, datetime.now().isoformat())
+            )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"保存协商价格时出错: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def get_agreed_price(self, chat_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT item_id, original_amount, agreed_price, discount_rate, store_name FROM agreed_prices WHERE chat_id = ?", (chat_id,))
+            result = cursor.fetchone()
+            if result:
+                return {"item_id": result[0], "original_amount": result[1], "agreed_price": result[2], "discount_rate": result[3], "store_name": result[4]}
+            return None
+        except Exception as e:
+            logger.error(f"获取协商价格时出错: {e}")
+            return None
+        finally:
+            conn.close()

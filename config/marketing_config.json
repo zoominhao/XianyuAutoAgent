@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "strategies": {
+    "default": {
+      "display_discount": "8折",
+      "actual_discount_rate": 0.90,
+      "excuse_replies": [
+        "门店那边提示您的账单里有不能参与折扣的商品，给您的报价是您所在的门店最大的折扣了",
+        "跟门店确认过了，部分商品不参与活动，当前报价已经是最优惠的了"
+      ],
+      "excuse_image": ""
+    }
+  },
+  "items": {
+    "1040139119406": {
+      "strategy": "default"
+    }
+  }
+}

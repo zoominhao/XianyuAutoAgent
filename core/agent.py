@@ -1,8 +1,33 @@
 import re
-from typing import List, Dict
+import json
+from typing import List, Dict, Optional
 import os
 from openai import OpenAI
 from loguru import logger
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+CONFIG_DIR = os.path.join(PROJECT_ROOT, 'config')
+
+
+def load_marketing_config(item_id=None):
+    config_path = os.path.join(CONFIG_DIR, 'marketing_config.json')
+    if not os.path.exists(config_path):
+        return None
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    if not cfg.get('enabled'):
+        return None
+    strategy_name = cfg.get('items', {}).get(item_id, {}).get('strategy', 'default') if item_id else 'default'
+    return cfg.get('strategies', {}).get(strategy_name)
+
+
+def load_bargain_config():
+    config_path = os.path.join(CONFIG_DIR, 'bargain_config.json')
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"global": {"discount_rate": 0.85, "min_amount": 10, "max_bargain_rounds": 3}, "items": {}}
 
 
 class XianyuReplyBot:
@@ -15,7 +40,9 @@ class XianyuReplyBot:
         self._init_system_prompts()
         self._init_agents()
         self.router = IntentRouter(self.agents['classify'])
-        self.last_intent = None  # 记录最后一次意图
+        self.last_intent = None
+        self.last_marketing = None
+        self.last_reply_is_excuse = False
 
 
     def _init_agents(self):
@@ -29,7 +56,7 @@ class XianyuReplyBot:
 
     def _init_system_prompts(self):
         """初始化各Agent专用提示词，优先加载用户自定义文件，否则使用Example默认文件"""
-        prompt_dir = "prompts"
+        prompt_dir = os.path.join(CONFIG_DIR, "prompts")
         
         def load_prompt_content(name: str) -> str:
             """尝试加载提示词文件"""
@@ -72,48 +99,72 @@ class XianyuReplyBot:
         user_assistant_msgs = [msg for msg in context if msg['role'] in ['user', 'assistant']]
         return "\n".join([f"{msg['role']}: {msg['content']}" for msg in user_assistant_msgs])
 
-    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict]) -> str:
+    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict], image_urls: Optional[List[str]] = None, item_id: str = None) -> str:
         """生成回复主流程"""
-        # 记录用户消息
-        # logger.debug(f'用户所发消息: {user_msg}')
-        
         formatted_context = self.format_history(context)
-        # logger.debug(f'对话历史: {formatted_context}')
-        
-        # 1. 路由决策
-        detected_intent = self.router.detect(user_msg, item_desc, formatted_context)
 
-
+        # 1. 路由决策（图片消息默认走 default Agent）
+        if image_urls:
+            detected_intent = 'default'
+        else:
+            detected_intent = self.router.detect(user_msg, item_desc, formatted_context)
 
         # 2. 获取对应Agent
-
-        internal_intents = {'classify'}  # 定义不对外开放的Agent
+        internal_intents = {'classify'}
 
         if detected_intent == 'no_reply':
-            # 无需回复的情况
             logger.info(f'意图识别完成: no_reply - 无需回复')
             self.last_intent = 'no_reply'
-            return "-"  # 返回特殊标记，表示无需回复
+            return "-"
         elif detected_intent in self.agents and detected_intent not in internal_intents:
             agent = self.agents[detected_intent]
             logger.info(f'意图识别完成: {detected_intent}')
-            self.last_intent = detected_intent  # 保存当前意图
+            self.last_intent = detected_intent
         else:
             agent = self.agents['default']
             logger.info(f'意图识别完成: default')
-            self.last_intent = 'default'  # 保存当前意图
-        
+            self.last_intent = 'default'
+
         # 3. 获取议价次数
         bargain_count = self._extract_bargain_count(context)
         logger.info(f'议价次数: {bargain_count}')
 
-        # 4. 生成回复
-        return agent.generate(
+        # 4. 加载议价配置（议价和图片消息都需要）
+        bargain_cfg = None
+        if (detected_intent == 'price' or image_urls) and item_id:
+            cfg = load_bargain_config()
+            bargain_cfg = cfg.get("items", {}).get(item_id, cfg.get("global", {}))
+
+        # 5. 加载营销策略
+        marketing = load_marketing_config(item_id)
+        if marketing:
+            actual_rate = marketing.get("actual_discount_rate")
+            if actual_rate and bargain_cfg:
+                bargain_cfg = dict(bargain_cfg)
+                bargain_cfg["discount_rate"] = actual_rate
+
+        # 6. 生成回复
+        reply = agent.generate(
             user_msg=user_msg,
             item_desc=item_desc,
             context=formatted_context,
-            bargain_count=bargain_count
+            bargain_count=bargain_count,
+            image_urls=image_urls,
+            bargain_config=bargain_cfg,
+            marketing=marketing
         )
+
+        # 7. 标记是否触发了借口话术（供 main.py 发送截图用）
+        self.last_marketing = marketing
+        self.last_reply_is_excuse = False
+        if marketing and reply:
+            excuse_replies = marketing.get("excuse_replies", [])
+            for excuse in excuse_replies:
+                if excuse[:6] in reply:
+                    self.last_reply_is_excuse = True
+                    break
+
+        return reply
     
     def _extract_bargain_count(self, context: List[Dict]) -> int:
         """
@@ -206,18 +257,51 @@ class BaseAgent:
         self.system_prompt = system_prompt
         self.safety_filter = safety_filter
 
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0) -> str:
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0, image_urls: Optional[List[str]] = None, bargain_config: dict = None, marketing: dict = None) -> str:
         """生成回复模板方法"""
-        messages = self._build_messages(user_msg, item_desc, context)
+        messages = self._build_messages(user_msg, item_desc, context, image_urls=image_urls, bargain_config=bargain_config, marketing=marketing)
         response = self._call_llm(messages)
         return self.safety_filter(response)
 
-    def _build_messages(self, user_msg: str, item_desc: str, context: str) -> List[Dict]:
-        """构建消息链"""
-        return [
-            {"role": "system", "content": f"【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{self.system_prompt}"},
-            {"role": "user", "content": user_msg}
-        ]
+    IMAGE_ANALYSIS_PROMPT = (
+        "用户发送了一张图片，请仔细识别图片内容。\n"
+        "如果是账单/收据/小票：\n"
+        "1. 识别商家名称和账单总金额\n"
+        "2. 按照【议价规则】中的折扣计算优惠后价格（金额x折扣率，四舍五入到分）\n"
+        "3. 回复格式：'XX店账单XX元，打X折后XX元，确认的话直接拍，拍完我改价哈'\n"
+        "如果是其他图片：简要描述内容并礼貌回复。\n"
+        "回复要求：简短友好，总字数不超过60字。"
+    )
+
+    def _build_messages(self, user_msg: str, item_desc: str, context: str, image_urls: Optional[List[str]] = None, bargain_config: dict = None, marketing: dict = None) -> List[Dict]:
+        """构建消息链，支持图片和营销策略"""
+        marketing_info = ""
+        if marketing:
+            display = marketing.get("display_discount", "")
+            excuses = marketing.get("excuse_replies", [])
+            if display:
+                marketing_info += f"\n【营销策略】对外宣传折扣为{display}，但实际按议价规则中的折扣率计算。"
+            if excuses:
+                marketing_info += f"\n【差价解释话术】当买家质疑折扣和宣传不一致时，使用以下话术回复：\n- " + "\n- ".join(excuses)
+
+        if image_urls:
+            discount_info = ""
+            if bargain_config:
+                rate = bargain_config.get("discount_rate", 0.85)
+                discount_display = int(rate * 10)
+                discount_info = f"\n【议价规则】折扣率：{discount_display}折（即金额x{rate}）"
+            system_content = f"【商品信息】{item_desc}\n【你与客户对话历史】{context}{discount_info}{marketing_info}\n{self.IMAGE_ANALYSIS_PROMPT}"
+            system_msg = {"role": "system", "content": system_content}
+            user_content = [{"type": "text", "text": user_msg if user_msg and user_msg.strip() != '[图片]' else "请分析这张图片"}]
+            for url in image_urls:
+                user_content.append({"type": "image_url", "image_url": {"url": url}})
+            user_msg_obj = {"role": "user", "content": user_content}
+        else:
+            system_content = f"【商品信息】{item_desc}\n【你与客户对话历史】{context}{marketing_info}\n{self.system_prompt}"
+            system_msg = {"role": "system", "content": system_content}
+            user_msg_obj = {"role": "user", "content": user_msg}
+
+        return [system_msg, user_msg_obj]
 
     def _call_llm(self, messages: List[Dict], temperature: float = 0.4) -> str:
         """调用大模型"""
@@ -234,11 +318,20 @@ class BaseAgent:
 class PriceAgent(BaseAgent):
     """议价处理Agent"""
 
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
-        """重写生成逻辑"""
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0, image_urls: Optional[List[str]] = None, bargain_config: dict = None, marketing: dict = None) -> str:
         dynamic_temp = self._calc_temperature(bargain_count)
-        messages = self._build_messages(user_msg, item_desc, context)
-        messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
+        messages = self._build_messages(user_msg, item_desc, context, image_urls=image_urls, bargain_config=bargain_config, marketing=marketing)
+
+        cfg_info = f"\n▲当前议价轮次：{bargain_count}"
+        if bargain_config:
+            rate = bargain_config.get("discount_rate", 0.85)
+            discount_display = int(rate * 10)
+            max_rounds = bargain_config.get("max_bargain_rounds", 3)
+            bottom_msg = bargain_config.get("bottom_line_message", "已经是最低价了")
+            cfg_info += f"\n▲议价规则：账单金额按{discount_display}折计算，不能再低，最多议价{max_rounds}轮"
+            if bargain_count >= max_rounds:
+                cfg_info += f"\n▲已达议价上限，请坚守底线：{bottom_msg}"
+        messages[0]['content'] += cfg_info
 
         response = self.client.chat.completions.create(
             model=os.getenv("MODEL_NAME", "qwen-max"),
@@ -250,16 +343,14 @@ class PriceAgent(BaseAgent):
         return self.safety_filter(response.choices[0].message.content)
 
     def _calc_temperature(self, bargain_count: int) -> float:
-        """动态温度策略"""
         return min(0.3 + bargain_count * 0.15, 0.9)
 
 
 class TechAgent(BaseAgent):
     """技术咨询Agent"""
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
-        """重写生成逻辑"""
-        messages = self._build_messages(user_msg, item_desc, context)
-        # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
+
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0, image_urls: Optional[List[str]] = None, bargain_config: dict = None, marketing: dict = None) -> str:
+        messages = self._build_messages(user_msg, item_desc, context, image_urls=image_urls, marketing=marketing)
 
         response = self.client.chat.completions.create(
             model=os.getenv("MODEL_NAME", "qwen-max"),
@@ -271,21 +362,12 @@ class TechAgent(BaseAgent):
                 "enable_search": True,
             }
         )
-
         return self.safety_filter(response.choices[0].message.content)
-
-
-    # def _fetch_tech_specs(self) -> str:
-    #     """模拟获取技术参数（可连接数据库）"""
-    #     return "功率：200W@8Ω\n接口：XLR+RCA\n频响：20Hz-20kHz"
 
 
 class ClassifyAgent(BaseAgent):
     """意图识别Agent"""
-
-    def generate(self, **args) -> str:
-        response = super().generate(**args)
-        return response
+    pass
 
 
 class DefaultAgent(BaseAgent):

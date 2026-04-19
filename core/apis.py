@@ -2,6 +2,7 @@ import time
 import os
 import re
 import sys
+import json
 
 import requests
 from loguru import logger
@@ -253,6 +254,69 @@ class XianyuApis:
             logger.error(f"Token API请求异常: {str(e)}")
             time.sleep(0.5)
             return self.get_token(device_id, retry_count + 1)
+
+    def modify_order_price(self, order_id, new_price, retry_count=0):
+        """修改订单价格
+        Args:
+            order_id: 订单ID
+            new_price: 新价格（元）
+        """
+        if retry_count >= 3:
+            logger.error("修改订单价格失败，重试次数过多")
+            return {"error": "修改订单价格失败"}
+
+        modify_fee = str(int(float(new_price) * 100))
+
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': str(int(time.time()) * 1000),
+            'sign': '',
+            'v': '1.0',
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': 'mtop.taobao.idle.trade.user.adjust.price',
+            'sessionOption': 'AutoLoginOnly',
+        }
+
+        data_val = json.dumps({
+            "modifyFee": modify_fee,
+            "newTransportFee": "0",
+            "orderId": str(order_id)
+        }, ensure_ascii=False)
+        data = {'data': data_val}
+
+        token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+        sign = generate_sign(params['t'], token, data_val)
+        params['sign'] = sign
+
+        try:
+            response = self.session.post(
+                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.user.adjust.price/1.0/',
+                params=params,
+                data=data
+            )
+            res_json = response.json()
+
+            if isinstance(res_json, dict):
+                ret_value = res_json.get('ret', [])
+                if any('SUCCESS' in ret for ret in ret_value):
+                    logger.info(f"✅ 订单 {order_id} 改价成功 → {new_price}元")
+                    return res_json
+                else:
+                    logger.warning(f"改价失败: {ret_value}")
+                    if 'Set-Cookie' in response.headers:
+                        self.clear_duplicate_cookies()
+                    time.sleep(0.5)
+                    return self.modify_order_price(order_id, new_price, retry_count + 1)
+            return res_json
+
+        except Exception as e:
+            logger.error(f"改价API请求异常: {str(e)}")
+            time.sleep(0.5)
+            return self.modify_order_price(order_id, new_price, retry_count + 1)
 
     def get_item_info(self, item_id, retry_count=0):
         """获取商品信息，自动处理token失效的情况"""

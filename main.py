@@ -6,14 +6,14 @@ import os
 import websockets
 from loguru import logger
 from dotenv import load_dotenv, set_key
-from XianyuApis import XianyuApis
 import sys
 import random
 
-
+from core.apis import XianyuApis
+from core.agent import XianyuReplyBot
+from core.context_manager import ChatContextManager
+from core.notifier import send_order_notification
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
-from XianyuAgent import XianyuReplyBot
-from context_manager import ChatContextManager
 
 
 class XianyuLive:
@@ -110,13 +110,25 @@ class XianyuLive:
                 await asyncio.sleep(60)
 
     async def send_msg(self, ws, cid, toid, text):
-        text = {
+        content = {
             "contentType": 1,
             "text": {
                 "text": text
             }
         }
-        text_base64 = str(base64.b64encode(json.dumps(text).encode('utf-8')), 'utf-8')
+        await self._send_content(ws, cid, toid, content)
+
+    async def send_image(self, ws, cid, toid, image_url, width=800, height=600):
+        content = {
+            "contentType": 2,
+            "image": {
+                "pics": [{"url": image_url, "width": width, "height": height, "type": 0}]
+            }
+        }
+        await self._send_content(ws, cid, toid, content)
+
+    async def _send_content(self, ws, cid, toid, content):
+        content_base64 = str(base64.b64encode(json.dumps(content).encode('utf-8')), 'utf-8')
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
@@ -131,7 +143,7 @@ class XianyuLive:
                         "contentType": 101,
                         "custom": {
                             "type": 1,
-                            "data": text_base64
+                            "data": content_base64
                         }
                     },
                     "redPointPolicy": 0,
@@ -192,8 +204,8 @@ class XianyuLive:
         """判断是否为用户聊天消息"""
         try:
             return (
-                isinstance(message, dict) 
-                and "1" in message 
+                isinstance(message, dict)
+                and "1" in message
                 and isinstance(message["1"], dict)  # 确保是字典类型
                 and "10" in message["1"]
                 and isinstance(message["1"]["10"], dict)  # 确保是字典类型
@@ -201,6 +213,18 @@ class XianyuLive:
             )
         except Exception:
             return False
+
+    def extract_image_urls(self, message):
+        """从消息中提取图片URL"""
+        try:
+            content_str = message["1"]["6"]["3"]["5"]
+            content = json.loads(content_str)
+            if content.get("contentType") == 2:
+                pics = content.get("image", {}).get("pics", [])
+                return [p["url"] for p in pics if "url" in p]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            pass
+        return []
 
     def is_sync_package(self, message_data):
         """判断是否为同步包消息"""
@@ -249,9 +273,10 @@ class XianyuLive:
         try:
             if not message or not isinstance(message, str):
                 return False
-            
+
             clean_message = message.strip()
-            # 检查是否以 [ 开头，以 ] 结尾
+            if clean_message == '[图片]':
+                return False
             if clean_message.startswith('[') and clean_message.endswith(']'):
                 logger.debug(f"检测到系统消息: {clean_message}")
                 return True
@@ -259,6 +284,23 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"检查系统消息失败: {e}")
             return False
+
+    def _try_save_agreed_price(self, bot_reply, chat_id, item_id):
+        """从AI回复中提取账单金额和折后价并保存"""
+        import re as _re
+        try:
+            amounts = _re.findall(r'(\d+(?:\.\d+)?)\s*元', bot_reply)
+            if len(amounts) >= 2:
+                original = float(amounts[0])
+                agreed = float(amounts[1])
+                if agreed < original:
+                    rate = round(agreed / original, 2)
+                    store_match = _re.search(r'(.+?)(?:账单|的|消费)', bot_reply)
+                    store_name = store_match.group(1).strip() if store_match else ""
+                    self.context_manager.save_agreed_price(chat_id, item_id, original, agreed, rate, store_name)
+                    logger.info(f"已保存协商价格: {store_name} {original}元 → {agreed}元 (会话: {chat_id})")
+        except Exception as e:
+            logger.debug(f"提取协商价格失败: {e}")
 
     def check_toggle_keywords(self, message):
         """检查消息是否包含切换关键词"""
@@ -405,21 +447,81 @@ class XianyuLive:
                 return
 
             try:
-                # 判断是否为订单消息,需要自行编写付款后的逻辑
-                if message['3']['redReminder'] == '等待买家付款':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'等待买家 {user_url} 付款')
+                reminder = message['3'].get('redReminder', '')
+                if reminder == '等待买家付款':
+                    # 尝试提取订单相关信息
+                    chat_id_raw = message.get('1', '')
+                    if isinstance(chat_id_raw, str):
+                        buyer_id = chat_id_raw.split('@')[0]
+                    elif isinstance(chat_id_raw, dict):
+                        buyer_id = str(chat_id_raw.get('1', {}).get('1', '')).split('@')[0]
+                    else:
+                        buyer_id = 'unknown'
+
+                    logger.info(f'📦 买家 {buyer_id} 已下单，等待付款')
+
+                    # 尝试从消息中提取orderId
+                    order_id = None
+                    try:
+                        msg_str = json.dumps(message, ensure_ascii=False, default=str)
+                        import re as _re
+                        order_match = _re.search(r'orderId["\s:=]+(\d+)', msg_str)
+                        if order_match:
+                            order_id = order_match.group(1)
+                    except:
+                        pass
+
+                    # 查找最近的协商价格
+                    try:
+                        import sqlite3 as _sql
+                        conn = _sql.connect(self.context_manager.db_path)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT chat_id, original_amount, agreed_price, store_name FROM agreed_prices ORDER BY last_updated DESC LIMIT 1"
+                        )
+                        result = cursor.fetchone()
+                        conn.close()
+
+                        if result:
+                            chat_id_val, orig, agreed, store = result
+                            logger.info(f'💰 协商价格: {store} {orig}元→{agreed}元')
+
+                            if order_id:
+                                logger.info(f'🔧 正在自动改价: 订单 {order_id} → {agreed}元')
+                                modify_result = self.xianyu.modify_order_price(order_id, agreed)
+                                if 'error' not in str(modify_result):
+                                    logger.info(f'✅ 自动改价成功: {agreed}元')
+                                    send_order_notification(
+                                        order_id=order_id,
+                                        store_name=store,
+                                        original_amount=orig,
+                                        agreed_price=agreed,
+                                        discount_rate=agreed / orig if orig else 0,
+                                        buyer_id=buyer_id
+                                    )
+                                else:
+                                    logger.warning(f'❌ 自动改价失败，请手动改价为 {agreed}元')
+                            else:
+                                logger.info(f'💰 未提取到订单号，请手动改价为 {agreed}元')
+                                send_order_notification(
+                                    order_id="待确认",
+                                    store_name=store,
+                                    original_amount=orig,
+                                    agreed_price=agreed,
+                                    discount_rate=agreed / orig if orig else 0,
+                                    buyer_id=buyer_id
+                                )
+                    except Exception as e:
+                        logger.debug(f"自动改价流程异常: {e}")
+
                     return
-                elif message['3']['redReminder'] == '交易关闭':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'买家 {user_url} 交易关闭')
+                elif reminder == '交易关闭':
+                    user_id = message['1'].split('@')[0] if isinstance(message['1'], str) else 'unknown'
+                    logger.info(f'买家 {user_id} 交易关闭')
                     return
-                elif message['3']['redReminder'] == '等待卖家发货':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'交易成功 {user_url} 等待卖家发货')
+                elif reminder == '等待卖家发货':
+                    user_id = message['1'].split('@')[0] if isinstance(message['1'], str) else 'unknown'
+                    logger.info(f'✅ 买家 {user_id} 已付款，等待卖家发货')
                     return
 
             except:
@@ -472,9 +574,14 @@ class XianyuLive:
                 logger.info(f"卖家人工回复 (会话: {chat_id}, 商品: {item_id}): {send_message}")
                 return
             
-            logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
-            
-            
+            # 提取图片URL
+            image_urls = self.extract_image_urls(message)
+            if image_urls:
+                logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}, 图片: {len(image_urls)}张")
+            else:
+                logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
+
+
             # 如果当前会话处于人工接管模式，不进行自动回复
             if self.is_manual_mode(chat_id):
                 logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
@@ -502,23 +609,29 @@ class XianyuLive:
                     return
             else:
                 logger.info(f"从数据库获取商品信息: {item_id}")
-                
+
             item_description=f"当前商品的信息如下：{self.build_item_description(item_info)}"
-            
+
             # 获取完整的对话上下文
             context = self.context_manager.get_context_by_chat(chat_id)
             # 生成回复
             bot_reply = bot.generate_reply(
                 send_message,
                 item_description,
-                context=context
+                context=context,
+                image_urls=image_urls if image_urls else None,
+                item_id=item_id
             )
             
             # 检查是否需要回复
             if bot_reply == "-":
                 logger.info(f"[无需回复] 用户 {send_user_name} 的消息被识别为无需回复类型")
                 return
-            
+
+            # 如果是图片消息，尝试从回复中提取协商价格并保存
+            if image_urls and bot_reply:
+                self._try_save_agreed_price(bot_reply, chat_id, item_id)
+
             # 添加用户消息到上下文
             self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
             
@@ -546,7 +659,15 @@ class XianyuLive:
                 await asyncio.sleep(total_delay)
                 
             await self.send_msg(websocket, chat_id, send_user_id, bot_reply)
-            
+
+            # 如果触发了营销借口话术，追加发送截图
+            if bot.last_reply_is_excuse and bot.last_marketing:
+                excuse_image = bot.last_marketing.get("excuse_image", "")
+                if excuse_image:
+                    logger.info(f"发送营销借口截图: {excuse_image}")
+                    await asyncio.sleep(1)
+                    await self.send_image(websocket, chat_id, send_user_id, excuse_image)
+
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")
             logger.debug(f"原始消息: {message_data}")
