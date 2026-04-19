@@ -137,11 +137,6 @@ class XianyuReplyBot:
 
         # 5. 加载营销策略
         marketing = load_marketing_config(item_id)
-        if marketing:
-            actual_rate = marketing.get("actual_discount_rate")
-            if actual_rate and bargain_cfg:
-                bargain_cfg = dict(bargain_cfg)
-                bargain_cfg["discount_rate"] = actual_rate
 
         # 6. 生成回复
         reply = agent.generate(
@@ -264,13 +259,12 @@ class BaseAgent:
         return self.safety_filter(response)
 
     IMAGE_ANALYSIS_PROMPT = (
-        "用户发送了一张图片，请仔细识别图片内容。\n"
-        "如果是账单/收据/小票：\n"
-        "1. 识别商家名称和账单总金额\n"
-        "2. 按照【议价规则】中的折扣计算优惠后价格（金额x折扣率，四舍五入到分）\n"
-        "3. 回复格式：'XX店账单XX元，打X折后XX元，确认的话直接拍，拍完我改价哈'\n"
-        "如果是其他图片：简要描述内容并礼貌回复。\n"
-        "回复要求：简短友好，总字数不超过60字。"
+        "用户发了一张图片。\n"
+        "如果是消费账单/收据/小票（不限商家类型）：\n"
+        "识别商家名称和总金额。如果系统提供了【计算好的报价】就直接用那个数字报价，不要自己算。\n"
+        "告诉买家原价多少、优惠后多少，引导拍链接。\n"
+        "如果不是账单：引导发账单。\n"
+        "不要提商品名称。不要说'改价'。不超过两句话。"
     )
 
     def _build_messages(self, user_msg: str, item_desc: str, context: str, image_urls: Optional[List[str]] = None, bargain_config: dict = None, marketing: dict = None) -> List[Dict]:
@@ -282,14 +276,14 @@ class BaseAgent:
             if display:
                 marketing_info += f"\n【营销策略】对外宣传折扣为{display}，但实际按议价规则中的折扣率计算。"
             if excuses:
-                marketing_info += f"\n【差价解释话术】当买家质疑折扣和宣传不一致时，使用以下话术回复：\n- " + "\n- ".join(excuses)
+                marketing_info += f"\n【差价解释话术 - 仅当买家明确质疑折扣不对时才用，普通还价不要用这个】\n- " + "\n- ".join(excuses)
+                marketing_info += "\n注意：买家只是普通还价时，按正常议价策略让价，不要用上面的解释话术"
 
         if image_urls:
             discount_info = ""
             if bargain_config:
-                rate = bargain_config.get("discount_rate", 0.85)
-                discount_display = int(rate * 10)
-                discount_info = f"\n【议价规则】折扣率：{discount_display}折（即金额x{rate}）"
+                rate = bargain_config.get("initial_rate", bargain_config.get("discount_rate", 0.85))
+                discount_info = f"\n【折扣计算规则】识别出总金额后，优惠价 = 总金额 × {rate}，请你算好后直接报这个价，不要用别的折扣率"
             system_content = f"【商品信息】{item_desc}\n【你与客户对话历史】{context}{discount_info}{marketing_info}\n{self.IMAGE_ANALYSIS_PROMPT}"
             system_msg = {"role": "system", "content": system_content}
             user_content = [{"type": "text", "text": user_msg if user_msg and user_msg.strip() != '[图片]' else "请分析这张图片"}]
@@ -322,15 +316,25 @@ class PriceAgent(BaseAgent):
         dynamic_temp = self._calc_temperature(bargain_count)
         messages = self._build_messages(user_msg, item_desc, context, image_urls=image_urls, bargain_config=bargain_config, marketing=marketing)
 
-        cfg_info = f"\n▲当前议价轮次：{bargain_count}"
+        cfg_info = ""
         if bargain_config:
-            rate = bargain_config.get("discount_rate", 0.85)
-            discount_display = int(rate * 10)
-            max_rounds = bargain_config.get("max_bargain_rounds", 3)
+            floor_rate = bargain_config.get("discount_rate", 0.85)
+            initial_rate = bargain_config.get("initial_rate", floor_rate)
             bottom_msg = bargain_config.get("bottom_line_message", "已经是最低价了")
-            cfg_info += f"\n▲议价规则：账单金额按{discount_display}折计算，不能再低，最多议价{max_rounds}轮"
-            if bargain_count >= max_rounds:
-                cfg_info += f"\n▲已达议价上限，请坚守底线：{bottom_msg}"
+            floor_display = int(floor_rate * 100)
+            gap = initial_rate - floor_rate
+
+            if bargain_count == 0:
+                if gap > 0.05:
+                    cfg_info += "\n▲第一次还价，离底线还有不少空间，可以大方让个二三十块，表现诚意"
+                else:
+                    cfg_info += "\n▲第一次还价，空间不大，让个十来块意思一下"
+            elif bargain_count <= 2:
+                cfg_info += f"\n▲第{bargain_count + 1}次还价了，还可以再让一些，幅度比上次小一点，表现出为难"
+            else:
+                cfg_info += f"\n▲已经第{bargain_count + 1}次了，最多再象征性让几块"
+            cfg_info += f"\n▲底线：最终价格不能低于账单金额的{floor_display}%，到了底线就用：{bottom_msg}"
+            cfg_info += "\n▲让步金额别太整（别刚好10、20、50），让17、23、8这种更自然"
         messages[0]['content'] += cfg_info
 
         response = self.client.chat.completions.create(

@@ -285,17 +285,44 @@ class XianyuLive:
             logger.error(f"检查系统消息失败: {e}")
             return False
 
+    def _try_update_agreed_price(self, bot_reply, chat_id, item_id):
+        """从议价回复中提取最新报价，更新协商价格"""
+        import re as _re
+        try:
+            existing = self.context_manager.get_agreed_price(chat_id)
+            if not existing:
+                return
+            # 匹配所有数字（带或不带元/块）
+            amounts = _re.findall(r'(\d+(?:\.\d+)?)', bot_reply)
+            # 过滤：保留合理范围内的金额（大于50，小于原价）
+            orig = existing['original_amount']
+            candidates = [float(a) for a in amounts if 50 < float(a) <= orig]
+            if candidates:
+                new_price = min(candidates)
+                if new_price < existing['agreed_price'] and new_price >= orig * 0.5:
+                    self.context_manager.save_agreed_price(
+                        chat_id, item_id, orig,
+                        new_price, new_price / orig,
+                        existing.get('store_name', '')
+                    )
+                    logger.info(f"协商价格已更新: {existing['agreed_price']}元 → {new_price}元")
+        except Exception as e:
+            logger.debug(f"更新协商价格失败: {e}")
+
     def _try_save_agreed_price(self, bot_reply, chat_id, item_id):
         """从AI回复中提取账单金额和折后价并保存"""
         import re as _re
         try:
-            amounts = _re.findall(r'(\d+(?:\.\d+)?)\s*元', bot_reply)
+            # 匹配带"元"或不带"元"的数字
+            amounts = _re.findall(r'(\d+(?:\.\d+)?)\s*元?', bot_reply)
+            # 过滤掉太小的数字（避免匹配到无关数字）
+            amounts = [a for a in amounts if float(a) > 50]
             if len(amounts) >= 2:
                 original = float(amounts[0])
                 agreed = float(amounts[1])
                 if agreed < original:
                     rate = round(agreed / original, 2)
-                    store_match = _re.search(r'(.+?)(?:账单|的|消费)', bot_reply)
+                    store_match = _re.search(r'(.{2,10}?)(?:账单|的账|消费|原价)', bot_reply)
                     store_name = store_match.group(1).strip() if store_match else ""
                     self.context_manager.save_agreed_price(chat_id, item_id, original, agreed, rate, store_name)
                     logger.info(f"已保存协商价格: {store_name} {original}元 → {agreed}元 (会话: {chat_id})")
@@ -386,11 +413,10 @@ class XianyuLive:
             price_display = f"¥{main_price}"
 
         summary = {
-            "title": item_info.get('title', ''),
-            "desc": item_info.get('desc', ''),
             "price_range": price_display,
             "total_stock": item_info.get('quantity', 0),
-            "sku_details": clean_skus
+            "sku_details": clean_skus,
+            "note": "这是一个代付折扣服务链接，接受任何商家的消费账单"
         }
 
         return json.dumps(summary, ensure_ascii=False)
@@ -449,7 +475,9 @@ class XianyuLive:
             try:
                 reminder = message['3'].get('redReminder', '')
                 if reminder == '等待买家付款':
-                    # 尝试提取订单相关信息
+                    # 打印完整消息结构，用于定位订单号
+                    logger.debug(f"订单消息完整结构: {json.dumps(message, ensure_ascii=False, default=str)}")
+
                     chat_id_raw = message.get('1', '')
                     if isinstance(chat_id_raw, str):
                         buyer_id = chat_id_raw.split('@')[0]
@@ -458,20 +486,28 @@ class XianyuLive:
                     else:
                         buyer_id = 'unknown'
 
-                    logger.info(f'📦 买家 {buyer_id} 已下单，等待付款')
-
-                    # 尝试从消息中提取orderId
+                    # 多种方式提取订单号
                     order_id = None
                     try:
                         msg_str = json.dumps(message, ensure_ascii=False, default=str)
                         import re as _re
-                        order_match = _re.search(r'orderId["\s:=]+(\d+)', msg_str)
-                        if order_match:
-                            order_id = order_match.group(1)
+                        # 尝试多种格式匹配
+                        for pattern in [r'orderId["\s:=]+(\d{15,})', r'orderid["\s:=]+(\d{15,})', r'"bizOrderId"["\s:=]+(\d{15,})', r'(\d{18,})']:
+                            order_match = _re.search(pattern, msg_str, _re.IGNORECASE)
+                            if order_match:
+                                order_id = order_match.group(1)
+                                logger.info(f"提取到订单号: {order_id}")
+                                break
                     except:
                         pass
 
-                    # 查找最近的协商价格
+                    # 保存订单号到数据库，供后续改价用
+                    if order_id:
+                        self.context_manager.save_pending_order(buyer_id, order_id)
+                        logger.info(f"📦 已保存订单号: 买家={buyer_id}, 订单={order_id}")
+
+                    # 查找协商价格
+                    agreed_info = None
                     try:
                         import sqlite3 as _sql
                         conn = _sql.connect(self.context_manager.db_path)
@@ -479,40 +515,33 @@ class XianyuLive:
                         cursor.execute(
                             "SELECT chat_id, original_amount, agreed_price, store_name FROM agreed_prices ORDER BY last_updated DESC LIMIT 1"
                         )
-                        result = cursor.fetchone()
+                        agreed_info = cursor.fetchone()
                         conn.close()
-
-                        if result:
-                            chat_id_val, orig, agreed, store = result
-                            logger.info(f'💰 协商价格: {store} {orig}元→{agreed}元')
-
-                            if order_id:
-                                logger.info(f'🔧 正在自动改价: 订单 {order_id} → {agreed}元')
-                                modify_result = self.xianyu.modify_order_price(order_id, agreed)
-                                if 'error' not in str(modify_result):
-                                    logger.info(f'✅ 自动改价成功: {agreed}元')
-                                    send_order_notification(
-                                        order_id=order_id,
-                                        store_name=store,
-                                        original_amount=orig,
-                                        agreed_price=agreed,
-                                        discount_rate=agreed / orig if orig else 0,
-                                        buyer_id=buyer_id
-                                    )
-                                else:
-                                    logger.warning(f'❌ 自动改价失败，请手动改价为 {agreed}元')
-                            else:
-                                logger.info(f'💰 未提取到订单号，请手动改价为 {agreed}元')
-                                send_order_notification(
-                                    order_id="待确认",
-                                    store_name=store,
-                                    original_amount=orig,
-                                    agreed_price=agreed,
-                                    discount_rate=agreed / orig if orig else 0,
-                                    buyer_id=buyer_id
-                                )
                     except Exception as e:
-                        logger.debug(f"自动改价流程异常: {e}")
+                        logger.debug(f"查询协商价格失败: {e}")
+
+                    if agreed_info and order_id:
+                        chat_id_val, orig, agreed, store = agreed_info
+                        logger.info(f'📦 买家 {buyer_id} 已下单，订单 {order_id}')
+                        logger.info(f'🔧 正在自动改价: {store} {orig}元→{agreed}元')
+                        modify_result = self.xianyu.modify_order_price(order_id, agreed)
+                        if 'error' not in str(modify_result):
+                            logger.info(f'✅ 自动改价成功: {agreed}元')
+                            send_order_notification(
+                                order_id=order_id,
+                                store_name=store,
+                                original_amount=orig,
+                                agreed_price=agreed,
+                                discount_rate=agreed / orig if orig else 0,
+                                buyer_id=buyer_id
+                            )
+                        else:
+                            logger.warning(f'❌ 自动改价失败，请手动改价为 {agreed}元')
+                    elif agreed_info:
+                        chat_id_val, orig, agreed, store = agreed_info
+                        logger.warning(f'📦 买家 {buyer_id} 已下单，未提取到订单号，请手动改价为 {agreed}元')
+                    else:
+                        logger.info(f'📦 买家 {buyer_id} 已下单（无协商价格记录，跳过自动改价）')
 
                     return
                 elif reminder == '交易关闭':
@@ -532,8 +561,18 @@ class XianyuLive:
                 logger.debug("用户正在输入")
                 return
             elif not self.is_chat_message(message):
+                # 尝试从非聊天消息中提取订单号（订单详情消息）
+                try:
+                    msg3 = message.get("3", {})
+                    if isinstance(msg3, dict) and "orderId" in msg3:
+                        order_id = msg3["orderId"]
+                        buyer_id = msg3.get("extUserId", "")
+                        if order_id and buyer_id:
+                            self.context_manager.save_pending_order(buyer_id, order_id)
+                            logger.info(f"📦 从订单详情提取: 买家={buyer_id}, 订单={order_id}")
+                except:
+                    pass
                 logger.debug("其他非聊天消息")
-                logger.debug(f"原始消息: {message}")
                 return
 
             # 处理聊天消息
@@ -574,6 +613,79 @@ class XianyuLive:
                 logger.info(f"卖家人工回复 (会话: {chat_id}, 商品: {item_id}): {send_message}")
                 return
             
+            # 检测买家是否在说已下单，触发改价流程
+            # 如果该会话已经完成改价，不再进入议价流程
+            pending_order = self.context_manager.get_pending_order(send_user_id)
+            if pending_order:
+                agreed_info = self.context_manager.get_agreed_price(chat_id)
+                if agreed_info:
+                    price = agreed_info['agreed_price']
+                    context = self.context_manager.get_context_by_chat(chat_id)
+                    formatted_context = bot.format_history(context)
+                    msg = bot.client.chat.completions.create(
+                        model=os.getenv("MODEL_NAME", "qwen-max"),
+                        messages=[
+                            {"role": "system", "content": f"你是闲鱼卖家，订单已改价为{price}元。买家可能在问价、还价或闲聊。不管买家说什么，用自然的方式告诉他价格已经改好了，引导付款。不能再议价，语气友好自然，不超过两句话。不要说'改价'这个词。\n对话历史：{formatted_context}"},
+                            {"role": "user", "content": send_message}
+                        ],
+                        temperature=0.8,
+                        max_tokens=100
+                    ).choices[0].message.content
+                    await self.send_msg(websocket, chat_id, send_user_id, msg)
+                    self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
+                    self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", msg)
+                    return
+
+            order_keywords = ['下单', '已拍', '拍了', '拍下', '拍好', '付款', '待付款', '改价', '改下价', '改一下价']
+            if any(kw in send_message for kw in order_keywords):
+                agreed_info = self.context_manager.get_agreed_price(chat_id)
+                if agreed_info:
+                    agreed = agreed_info['agreed_price']
+                    orig = agreed_info['original_amount']
+                    store = agreed_info.get('store_name', '')
+                    logger.info(f"🔧 买家表示已下单，尝试改价: {store} {orig}元→{agreed}元")
+                    await self.send_msg(websocket, chat_id, send_user_id, "好的，正在为您处理~")
+
+                    # 先从当前消息提取订单号
+                    order_id = None
+                    try:
+                        msg_str = json.dumps(message, ensure_ascii=False, default=str)
+                        import re as _re
+                        for pattern in [r'orderId["\s:=]+(\d{15,})', r'(\d{18,})']:
+                            order_match = _re.search(pattern, msg_str, _re.IGNORECASE)
+                            if order_match:
+                                order_id = order_match.group(1)
+                                break
+                    except:
+                        pass
+
+                    # 如果消息里没有，从数据库查之前系统通知保存的订单号
+                    if not order_id:
+                        order_id = self.context_manager.get_pending_order(send_user_id)
+                        if order_id:
+                            logger.info(f"从数据库获取到订单号: {order_id}")
+
+                    if order_id:
+                        modify_result = self.xianyu.modify_order_price(order_id, agreed)
+                        if 'error' not in str(modify_result):
+                            logger.info(f"✅ 自动改价成功: 订单 {order_id} → {agreed}元")
+                            await self.send_msg(websocket, chat_id, send_user_id, f"价格已经调好了，{agreed}元，直接付款就行~")
+                            send_order_notification(
+                                order_id=order_id, store_name=store,
+                                original_amount=orig, agreed_price=agreed,
+                                discount_rate=agreed / orig if orig else 0,
+                                buyer_id=send_user_id
+                            )
+                        else:
+                            logger.warning(f"❌ 自动改价失败，请手动改价为 {agreed}元")
+                            await self.send_msg(websocket, chat_id, send_user_id, "稍等一下，马上帮你处理~")
+                    else:
+                        logger.warning(f"💰 未找到订单号，请手动改价为 {agreed}元")
+                        await self.send_msg(websocket, chat_id, send_user_id, "收到，稍等帮你处理~")
+
+                    self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
+                    return
+
             # 提取图片URL
             image_urls = self.extract_image_urls(message)
             if image_urls:
@@ -635,11 +747,13 @@ class XianyuLive:
             # 添加用户消息到上下文
             self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
             
-            # 检查是否为价格意图，如果是则增加议价次数
+            # 检查是否为价格意图，如果是则增加议价次数，并更新协商价格
             if bot.last_intent == "price":
                 self.context_manager.increment_bargain_count_by_chat(chat_id)
                 bargain_count = self.context_manager.get_bargain_count_by_chat(chat_id)
                 logger.info(f"用户 {send_user_name} 对商品 {item_id} 的议价次数: {bargain_count}")
+                # 从回复中提取最新报价并更新
+                self._try_update_agreed_price(bot_reply, chat_id, item_id)
             
             # 添加机器人回复到上下文
             self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", bot_reply)

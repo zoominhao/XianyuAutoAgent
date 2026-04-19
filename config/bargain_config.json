@@ -1,14 +1,14 @@
 {
   "global": {
+    "initial_rate": 0.90,
     "discount_rate": 0.85,
-    "min_amount": 10,
-    "max_bargain_rounds": 3,
+    "max_bargain_rounds": 10,
     "bottom_line_message": "这个折扣已经是最低了，不能再少了"
   },
   "items": {
     "1040139119406": {
+      "initial_rate": 0.88,
       "discount_rate": 0.80,
-      "min_amount": 10,
       "max_bargain_rounds": 5,
       "bottom_line_message": "八折已经很实在了，不能再低了"
     }

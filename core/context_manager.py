@@ -90,6 +90,15 @@ class ChatContextManager:
         )
         ''')
 
+        # 创建待处理订单表（保存订单号供改价用）
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_orders (
+            buyer_id TEXT PRIMARY KEY,
+            order_id TEXT,
+            last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
         # 创建商品信息表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS items (
@@ -318,6 +327,35 @@ class ChatContextManager:
         except Exception as e:
             logger.error(f"获取议价次数时出错: {e}")
             return 0
+        finally:
+            conn.close()
+
+    def save_pending_order(self, buyer_id, order_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO pending_orders (buyer_id, order_id, last_updated) VALUES (?, ?, ?) "
+                "ON CONFLICT(buyer_id) DO UPDATE SET order_id=?, last_updated=?",
+                (buyer_id, order_id, datetime.now().isoformat(), order_id, datetime.now().isoformat())
+            )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"保存待处理订单出错: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def get_pending_order(self, buyer_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT order_id FROM pending_orders WHERE buyer_id = ?", (buyer_id,))
+            result = cursor.fetchone()
+            return result[0] if result else None
+        except Exception as e:
+            logger.error(f"获取待处理订单出错: {e}")
+            return None
         finally:
             conn.close()
 

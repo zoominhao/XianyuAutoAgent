@@ -19,7 +19,7 @@ def send_order_notification(order_id, store_name, original_amount, agreed_price,
 
 def _build_content(order_id, store_name, original_amount, agreed_price, discount_rate, buyer_id):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    discount_display = int(discount_rate * 10) if discount_rate else '-'
+    discount_display = f"{round(discount_rate * 10, 2)}折（{round(discount_rate * 100, 1)}%）" if discount_rate else '-'
     return (
         f"<h2>闲鱼订单改价通知</h2>"
         f"<table border='1' cellpadding='8' cellspacing='0' style='border-collapse:collapse;'>"
